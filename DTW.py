@@ -13,6 +13,7 @@ import librosa.display  # Explicit import needed for specshow
 from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
+import pickle as pkl
 
 
 RANDOM_RECORD_NAME = "random"
@@ -422,6 +423,201 @@ def plot_confusion_matrix(y_true, y_pred, true_labels, pred_labels, set_name: st
     plt.show()
 
 
+def ctc_collapse(labels: List[int], blank_id: int) -> List[int]:
+    """
+    CTC collapse function B:
+    - Remove consecutive duplicates
+    - Remove blanks
+    """
+    collapsed = []
+    prev = None
+    for l in labels:
+        if l != prev:
+            if l != blank_id:
+                collapsed.append(l)
+        prev = l
+    return collapsed
+
+
+def ctc_extend_with_blanks(label_seq: List[int], blank_id: int) -> List[int]:
+    extended = [blank_id]
+    for l in label_seq:
+        extended.append(l)
+        extended.append(blank_id)
+    return extended
+
+
+def ctc_forward_sum(probs: NDArray[np.float32], label_seq: List[int], blank_id: int):
+    """
+    Forward pass (sum) for CTC without transitions.
+    probs: T x V
+    label_seq: list of label ids (no blanks)
+    """
+    T, _ = probs.shape
+    ext = ctc_extend_with_blanks(label_seq, blank_id)
+    S = len(ext)
+    alpha = np.zeros((T, S), dtype=np.float32)
+
+    alpha[0, 0] = probs[0, ext[0]]
+    if S > 1:
+        alpha[0, 1] = probs[0, ext[1]]
+
+    for t in range(1, T):
+        for s in range(S):
+            total = alpha[t - 1, s]
+            if s - 1 >= 0:
+                total += alpha[t - 1, s - 1]
+            if s - 2 >= 0 and ext[s] != blank_id and ext[s] != ext[s - 2]:
+                total += alpha[t - 1, s - 2]
+            alpha[t, s] = total * probs[t, ext[s]]
+
+    prob = alpha[T - 1, S - 1]
+    if S - 2 >= 0:
+        prob += alpha[T - 1, S - 2]
+    return alpha, prob, ext
+
+
+def ctc_forward_max(probs: NDArray[np.float32], label_seq: List[int], blank_id: int):
+    """
+    Forward pass (max) for forced alignment.
+    Returns alpha_max and backtrace.
+    """
+    T, _ = probs.shape
+    ext = ctc_extend_with_blanks(label_seq, blank_id)
+    S = len(ext)
+    alpha = np.full((T, S), -np.inf, dtype=np.float32)
+    back = np.full((T, S), -1, dtype=np.int32)
+
+    alpha[0, 0] = np.log(probs[0, ext[0]] + 1e-12)
+    if S > 1:
+        alpha[0, 1] = np.log(probs[0, ext[1]] + 1e-12)
+
+    for t in range(1, T):
+        for s in range(S):
+            best_prev = alpha[t - 1, s]
+            best_src = s
+            if s - 1 >= 0 and alpha[t - 1, s - 1] > best_prev:
+                best_prev = alpha[t - 1, s - 1]
+                best_src = s - 1
+            if s - 2 >= 0 and ext[s] != blank_id and ext[s] != ext[s - 2]:
+                if alpha[t - 1, s - 2] > best_prev:
+                    best_prev = alpha[t - 1, s - 2]
+                    best_src = s - 2
+            alpha[t, s] = best_prev + np.log(probs[t, ext[s]] + 1e-12)
+            back[t, s] = best_src
+
+    # end in last or second-to-last state
+    end_s = S - 1 if alpha[T - 1, S - 1] >= alpha[T - 1, S - 2] else S - 2
+    return alpha, back, ext, end_s
+
+
+def plot_pred_matrix(pred: NDArray[np.float32], id2label: Dict[int, str], title: str):
+    plt.figure(figsize=(6, 4))
+    plt.imshow(np.log(pred + 1e-12).T, aspect='auto', origin='lower', cmap='viridis')
+    plt.colorbar(label='log prob')
+    plt.yticks(list(id2label.keys()), [id2label[i] for i in id2label.keys()])
+    plt.xlabel('Time')
+    plt.ylabel('Label')
+    plt.title(title)
+    plt.show()
+
+
+def plot_alignment_on_probs(probs: NDArray[np.float32], ext: List[int], path_s: List[int], id2label: Dict[int, str], title: str):
+    plt.figure(figsize=(8, 4))
+    plt.imshow(np.log(probs + 1e-12).T, aspect='auto', origin='lower', cmap='viridis')
+    plt.plot(range(len(path_s)), [ext[s] for s in path_s], color='red', linewidth=2)
+    plt.yticks(list(id2label.keys()), [id2label[i] for i in id2label.keys()])
+    plt.xlabel('Time')
+    plt.ylabel('Label')
+    plt.title(title)
+    plt.show()
+
+
+def run_ctc_demo():
+    pred = np.zeros(shape=(5, 3), dtype=np.float32)
+    pred[0][0] = 0.8
+    pred[0][1] = 0.2
+    pred[1][0] = 0.2
+    pred[1][1] = 0.8
+    pred[2][0] = 0.3
+    pred[2][1] = 0.7
+    pred[3][0] = 0.09
+    pred[3][1] = 0.8
+    pred[3][2] = 0.11
+    pred[4][2] = 1.00
+
+    id2label = {0: 'a', 1: 'b', 2: '^'}
+    label2id = {v: k for k, v in id2label.items()}
+    blank_id = label2id['^']
+    label_seq = [label2id['a'], label2id['b'], label2id['a']]
+
+    plot_pred_matrix(pred, id2label, "CTC pred (log probs)")
+
+    alpha, prob, ext = ctc_forward_sum(pred, label_seq, blank_id)
+    print("CTC sum prob for 'aba':", float(prob))
+
+    alpha_max, back, ext, end_s = ctc_forward_max(pred, label_seq, blank_id)
+    # backtrace
+    path_s = [end_s]
+    for t in range(pred.shape[0] - 1, 0, -1):
+        path_s.append(back[t, path_s[-1]])
+    path_s = list(reversed(path_s))
+    path_labels = [id2label[ext[s]] for s in path_s]
+    print("CTC max path labels:", path_labels)
+    print("CTC max path prob:", float(np.exp(alpha_max[-1, end_s])))
+
+    plot_alignment_on_probs(pred, ext, path_s, id2label, "CTC forced alignment (demo)")
+    plt.figure(figsize=(6, 4))
+    plt.imshow(back.T, aspect='auto', origin='lower', cmap='viridis')
+    plt.colorbar(label='backtrace src state')
+    plt.title("Backtrace matrix (demo)")
+    plt.xlabel("Time")
+    plt.ylabel("CTC state")
+    plt.show()
+
+
+def run_force_align_pickle(path: str):
+    if not Path(path).is_file():
+        print(f"force_align.pkl not found at: {path}")
+        return
+    data = pkl.load(open(path, 'rb'))
+    probs = data['acoustic_model_out_probs'].astype(np.float32)
+    label_map = data['label_mapping']  # index -> char
+    id2label = {int(k): v for k, v in label_map.items()}
+    label2id = {v: k for k, v in id2label.items()}
+    blank_id = label2id.get('^', None)
+    if blank_id is None:
+        # try common blank tokens
+        for b in ['<blk>', '<blank>', '_']:
+            if b in label2id:
+                blank_id = label2id[b]
+                break
+    if blank_id is None:
+        raise ValueError("Blank label not found in label_mapping.")
+
+    text_to_align = data['text_to_align']
+    label_seq = [label2id[ch] for ch in text_to_align]
+
+    alpha_max, back, ext, end_s = ctc_forward_max(probs, label_seq, blank_id)
+    path_s = [end_s]
+    for t in range(probs.shape[0] - 1, 0, -1):
+        path_s.append(back[t, path_s[-1]])
+    path_s = list(reversed(path_s))
+    path_labels = [id2label[ext[s]] for s in path_s]
+
+    print("Force align text:", text_to_align)
+    print("Force align path prob:", float(np.exp(alpha_max[-1, end_s])))
+    print("Force align path labels:", ''.join(path_labels))
+
+    plot_alignment_on_probs(probs, ext, path_s, id2label, "CTC forced alignment (pickle)")
+    plt.figure(figsize=(6, 4))
+    plt.imshow(back.T, aspect='auto', origin='lower', cmap='viridis')
+    plt.colorbar(label='backtrace src state')
+    plt.title("Backtrace matrix (pickle)")
+    plt.xlabel("Time")
+    plt.ylabel("CTC state")
+    plt.show()
+
 
 def main():
     dataset_path = "records"
@@ -463,6 +659,8 @@ def main():
 
     plot_confusion_matrix(y_true_train, y_pred_train, [str(i) for i in range(0, 10)] + ['random'], labels, 'training')
     plot_confusion_matrix(y_true_validation, y_pred_validation, [str(i) for i in range(0, 10)] + ['random'], labels, 'validation')
+    run_ctc_demo()
+    run_force_align_pickle("force_align.pkl")
 
 
 if __name__ == '__main__':
